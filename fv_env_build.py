@@ -39,6 +39,7 @@ def extract_module_blocks(top_file_path, top_name):
 #   - driver/monitor modports
 ###############################################################################
 def generate_interfaces_from_top(top_file_path, interfaces_path):
+    has_interfaces = False
     with open(top_file_path, "r") as f:
         lines = f.readlines()
 
@@ -52,6 +53,7 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
 
         # Detect lines like: "// APB INTERFACE"
         if stripped.startswith("//") and "INTERFACE" in stripped.upper():
+            has_interfaces = True
             # If we were already collecting signals, store them first
             if inside_interface and interface_name and current_block:
                 interfaces[interface_name] = current_block
@@ -119,6 +121,8 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
         # Write the interface file
         with open(filename, "w") as f:
             f.writelines(body)
+        
+        return has_interfaces
 
 ###############################################################################
 # generate_fv_adapter
@@ -298,7 +302,7 @@ clean:
     if top_file_path:
         parameters, ports = extract_module_blocks(top_file_path, top_name)
         # Generate interface files from top module
-        generate_interfaces_from_top(top_file_path, interfaces_path)
+        has_interfaces = generate_interfaces_from_top(top_file_path, interfaces_path)
     else:
         parameters, ports = "", ""
 
@@ -400,9 +404,10 @@ clean:
         inst_name = intf_type.replace("_intf", "")
         fv_env_content.append(f"  {intf_type} {inst_name}();\n")
 
-    # Finally, the adapter instance
-    fv_env_content.append("\n")
-    fv_env_content.append("  fv_adapter fv_adapter(.*);\n")
+    # Finally, the adapter instance, if the interfaces are present
+    if has_interfaces:
+        fv_env_content.append("\n")
+        fv_env_content.append("  fv_adapter fv_adapter(.*);\n")
     fv_env_content.append("endmodule\n")
 
     # Write fv_env.sv
