@@ -5,6 +5,7 @@ import argparse
 import re
 import subprocess
 from pathlib import Path
+import vhdl_to_sv
 
 ###############################################################################
 # extract_module_blocks
@@ -14,19 +15,31 @@ from pathlib import Path
 # - returns: (parameters, ports) as strings
 ###############################################################################
 def extract_module_blocks(top_file_path, top_name):
+    ext = Path(top_file_path).suffix.lower()
+
     with open(top_file_path, "r") as f:
         content = f.read()
 
-    # Use regex to capture the parameter block: module <top_name> #( ... ) (
-    # This is optional, so we handle the case when there's no #(...)
+    # If VHDL file, convert to SystemVerilog-equivalent content first
+    if ext == ".vhd":
+        content = vhdl_to_sv.generate_sv_module(content, top_name)  # modifies content
+        # print(f"VHDL converted into:\n\n{content}")
+
+    # Now treat the content as SystemVerilog-style
     param_match = re.search(rf"module\s+{top_name}\s*#\((.*?)\)\s*\(", content, re.DOTALL)
     parameters = param_match.group(1).strip() if param_match else ""
 
-    # Use regex to capture the port block: module <top_name> #( ... )? ( ... );
     port_match = re.search(rf"module\s+{top_name}(?:\s*#\(.*?\))?\s*\((.*?)\);", content, re.DOTALL)
     ports = port_match.group(1).strip() if port_match else ""
 
-    return parameters, ports
+
+    # print("PARAMETERS AS A LIST -> \n")
+    # print(parameters.splitlines())
+    # print(type(content))
+    # print(type(parameters))
+    # print(type(ports))
+
+    return parameters, ports, content.splitlines()
 
 ###############################################################################
 # generate_interfaces_from_top
@@ -38,18 +51,24 @@ def extract_module_blocks(top_file_path, top_name):
 #   - a macro listing signals
 #   - driver/monitor modports
 ###############################################################################
-def generate_interfaces_from_top(top_file_path, interfaces_path):
+def generate_interfaces_from_top(params,top_content, interfaces_path):
     has_interfaces = False
-    with open(top_file_path, "r") as f:
-        lines = f.readlines()
+    # BUG: This function should receive the top file content as a parameter
+    # with open(top_file_path, "r") as f:
+    #     lines = f.readlines()
+
+    print("PARAMETERS RECEIVED IN INTERFACE GEN FUCNTION:\n")
+    print(params.splitlines()[0])
 
     current_block = []
     interface_name = ""
+    interface_names = []
     interfaces = {}
     inside_interface = False
 
-    for line in lines:
+    for line in top_content:
         stripped = line.strip()
+        # print(f"Processing line: {stripped}")
 
         # Detect lines like: "// APB INTERFACE"
         if stripped.startswith("//") and "INTERFACE" in stripped.upper():
@@ -57,6 +76,7 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
             # If we were already collecting signals, store them first
             if inside_interface and interface_name and current_block:
                 interfaces[interface_name] = current_block
+                interface_names.append(interface_name)
 
             # Extract the name from the comment, e.g. "APB" -> "apb"
             match = re.match(r"//\s*(.*?)\s+INTERFACE", stripped, re.IGNORECASE)
@@ -75,7 +95,8 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
                 inside_interface = False
                 interface_name = ""
                 current_block = []
-            elif re.match(r"^(input|output|inout|logic|wire|reg)", stripped):
+            # elif re.match(r"^(input|output|inout|logic|wire|reg)", stripped):
+            elif re.match(r"^(input|output|inout)(\s+(wire|reg|logic))?", stripped):
                 current_block.append(stripped)
 
     # If we ended on an interface block at EOF, store that last one
@@ -91,7 +112,8 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
         for s in signals:
             # Remove trailing commas or semicolons, plus direction keywords
             code = s.split("//")[0].strip().rstrip(",;")
-            code = re.sub(r"^(input|output|inout)\s+", "", code)
+            # code = re.sub(r"^(input|output|inout)\s+", "", code)
+            code = re.sub(r"^(input|output|inout)\s+(wire|reg|logic)?", "logic ", code)
 
             # Example: "logic [31:0] data_i;" => "    logic [31:0] data_i;"
             clean_signals.append(f"    {code};\n")
@@ -105,6 +127,10 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
         macro_name = f"{name}_port_intf_fields"
 
         body = [f"interface {name}_port_intf;\n"]
+        body.append(f"#(\n")
+        for line in params.splitlines():
+            body.append(f"    {line.strip()}\n")
+        body.append(f");\n")
         body.extend(clean_signals)
 
         # Format the macro on a single line with commas between signals
@@ -122,7 +148,7 @@ def generate_interfaces_from_top(top_file_path, interfaces_path):
         with open(filename, "w") as f:
             f.writelines(body)
         
-        return has_interfaces
+    return has_interfaces
 
 ###############################################################################
 # generate_fv_adapter
@@ -234,6 +260,10 @@ def generate_fv_adapter(fv_env_path, interfaces_path, fv_adapter_path):
         f.writelines(assigns)
         f.write("endmodule\n")
 
+def generate_fv_package(fv_pkg_path):
+    with open(fv_pkg_path, "w") as f:
+        f.write("package fv_pkg;\n\nendpackage\n")
+
 ###############################################################################
 # setup_formal_env
 #
@@ -292,19 +322,26 @@ clean:
         (verif_path / fname).touch()
 
     # Locate the top module file in rtl/
-    top_file_path = None
     for f in rtl_path.glob("*.*"):
         with open(f, "r") as f_in:
-            if re.search(rf"module\s+{top_name}\b", f_in.read()):
+            content = f_in.read()
+            if re.search(rf"\bmodule\s+{top_name}\b", content) or re.search(rf"\bentity\s+{top_name}\b", content, re.IGNORECASE):
                 top_file_path = f
                 break
+    
+    print(f"Found top file: {top_file_path}")
+
+
 
     if top_file_path:
-        parameters, ports = extract_module_blocks(top_file_path, top_name)
+        parameters, ports, content = extract_module_blocks(top_file_path, top_name)
         # Generate interface files from top module
-        has_interfaces = generate_interfaces_from_top(top_file_path, interfaces_path)
+        has_interfaces = generate_interfaces_from_top(parameters, content, interfaces_path)
     else:
         parameters, ports = "", ""
+
+    # print(f"Extracted parameters:\n{parameters}")
+    # print(f"Extracted ports:\n{ports}")
 
     clk_name = clocks[0] if clocks else "clk"
     disable_reset = f"!{reset_name}" if reset_active_low else reset_name
@@ -386,10 +423,15 @@ clean:
     ########################
     # Build fv_env.sv
     ########################
+    idented_params = ""
+    for line in parameters.splitlines():
+        idented_params += (f"  {line}\n")
+
     fv_env_content = [
+        "import fv_pkg::*;\n\n",
         "module fv_env\n",
         "  #(\n",
-        f"    {parameters}\n" if parameters else "",
+        f"  {idented_params}\n" if parameters else "",
         "  )\n",
         "  (\n",
     ]
@@ -428,17 +470,22 @@ clean:
             f.write(f"{path.relative_to(prd_path)}\n")
 
     # Build scripts/fv_run.tcl
+    ext = Path(top_file_path).suffix.lower()
+
+    language_flag = "-vhdl" if ext == ".vhd" else "-sv09"
+
+
     scripts_path = prd_path / "scripts"
     os.makedirs(scripts_path, exist_ok=True)
-    reset_prefix = "~" if reset_active_low else ""
+    reset_prefix = "!" if reset_active_low else ""
+
     fv_run_content = [
         "clear -all\n",
         "# analyze rtl\n",
-        "analyze -sv09 -f rtl/rtl.f\n",
-        "# src\n\n",
+        f"analyze {language_flag} rtl/rtl.f\n",
         "# analyze verif\n",
         "analyze -sv09 -f verif/verif.f\n\n",
-        f"elaborate -top {top_name}\n\n"
+        f"elaborate {language_flag} -top {top_name}\n"
     ]
     for clk in clocks:
         fv_run_content.append(f"clock {clk}\n")
@@ -453,6 +500,8 @@ clean:
         interfaces_path=interfaces_path,
         fv_adapter_path=verif_path / "fv_adapter.sv"
     )
+
+    generate_fv_package(fv_pkg_path=verif_path / "fv_pkg.sv")
 
     print(f"Formal environment setup completed in: {prd_path}")
 
