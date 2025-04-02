@@ -6,6 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 import vhdl_to_sv
+import parse_sv
 
 ###############################################################################
 # extract_module_blocks
@@ -25,12 +26,14 @@ def extract_module_blocks(top_file_path, top_name):
         content = vhdl_to_sv.generate_sv_module(content, top_name)  # modifies content
         # print(f"VHDL converted into:\n\n{content}")
 
+    print(content)
     # Now treat the content as SystemVerilog-style
     param_match = re.search(rf"module\s+{top_name}\s*#\((.*?)\)\s*\(", content, re.DOTALL)
     parameters = param_match.group(1).strip() if param_match else ""
 
     port_match = re.search(rf"module\s+{top_name}(?:\s*#\(.*?\))?\s*\((.*?)\);", content, re.DOTALL)
-    ports = port_match.group(1).strip() if port_match else ""
+    # ports = port_match.group(1).strip() if port_match else ""
+    ports = port_match.group(1) if port_match else ""
 
 
     # print("PARAMETERS AS A LIST -> \n")
@@ -38,6 +41,13 @@ def extract_module_blocks(top_file_path, top_name):
     # print(type(content))
     # print(type(parameters))
     # print(type(ports))
+    # for line in ports.splitlines():
+    #     name, rng = parse_sv.extract_sv_signal_info(line)
+    #     print(f"Signal: {name}, Range: {rng}")
+
+    # print("PORTS AS A LIST -> \n")
+    # print(ports.splitlines())
+
 
     return parameters, ports, content.splitlines()
 
@@ -51,90 +61,35 @@ def extract_module_blocks(top_file_path, top_name):
 #   - a macro listing signals
 #   - driver/monitor modports
 ###############################################################################
-def generate_interfaces_from_top(params,top_content, interfaces_path):
-    has_interfaces = False
-    # BUG: This function should receive the top file content as a parameter
-    # with open(top_file_path, "r") as f:
-    #     lines = f.readlines()
+def generate_interfaces(params, ports, interfaces_path):
 
-    print("PARAMETERS RECEIVED IN INTERFACE GEN FUCNTION:\n")
-    print(params.splitlines()[0])
-
-    current_block = []
-    interface_name = ""
-    interface_names = []
-    interfaces = {}
-    inside_interface = False
-
-    for line in top_content:
-        stripped = line.strip()
-        # print(f"Processing line: {stripped}")
-
-        # Detect lines like: "// APB INTERFACE"
-        if stripped.startswith("//") and "INTERFACE" in stripped.upper():
-            has_interfaces = True
-            # If we were already collecting signals, store them first
-            if inside_interface and interface_name and current_block:
-                interfaces[interface_name] = current_block
-                interface_names.append(interface_name)
-
-            # Extract the name from the comment, e.g. "APB" -> "apb"
-            match = re.match(r"//\s*(.*?)\s+INTERFACE", stripped, re.IGNORECASE)
-            if match:
-                interface_name = match.group(1).strip().lower().replace(" ", "_")
-                current_block = []
-                inside_interface = True
-            continue
-
-        # If we're inside a recognized interface block, collect signals until
-        # we see another "//", a blank line, or a ");" that indicates the end.
-        if inside_interface:
-            if stripped.startswith("//") or stripped == "" or stripped == ");":
-                if interface_name and current_block:
-                    interfaces[interface_name] = current_block
-                inside_interface = False
-                interface_name = ""
-                current_block = []
-            # elif re.match(r"^(input|output|inout|logic|wire|reg)", stripped):
-            elif re.match(r"^(input|output|inout)(\s+(wire|reg|logic))?", stripped):
-                current_block.append(stripped)
-
-    # If we ended on an interface block at EOF, store that last one
-    if inside_interface and interface_name and current_block:
-        interfaces[interface_name] = current_block
+    interfaces = parse_sv.parse_sv_interface_info(ports)
 
     # For each interface block found, create a <name>_port_intf.sv file
-    for name, signals in interfaces.items():
-        filename = interfaces_path / f"{name}_port_intf.sv"
+    for intf in interfaces:
+        filename = interfaces_path / f"{intf['if_name']}_port_intf.sv"
 
         clean_signals = []
-        signal_names = []
-        for s in signals:
-            # Remove trailing commas or semicolons, plus direction keywords
-            code = s.split("//")[0].strip().rstrip(",;")
-            # code = re.sub(r"^(input|output|inout)\s+", "", code)
-            code = re.sub(r"^(input|output|inout)\s+(wire|reg|logic)?", "logic ", code)
-
-            # Example: "logic [31:0] data_i;" => "    logic [31:0] data_i;"
-            clean_signals.append(f"    {code};\n")
-
-            # Extract final token as the signal name for the macro
-            tokens = code.split()
-            if tokens:
-                signal_names.append(tokens[-1])
-
         # We'll define a macro like apb_port_intf_fields with each signal name
-        macro_name = f"{name}_port_intf_fields"
+        macro_name = f"{intf['if_name']}_port_intf_fields"
+        macro_line = f"    `define {macro_name} \\\n        "
+        for i, (sig, rng) in enumerate(intf['content']):
+            clean_signals.append(f"    logic {rng} {sig};\n")
+            if i < len(intf['content']) - 1:
+                macro_line += f"{sig}, "
+            else:
+                macro_line += f"{sig}\n"
 
-        body = [f"interface {name}_port_intf;\n"]
+
+        body = [f"interface {intf['if_name']}_port_intf;\n"]
         body.append(f"#(\n")
-        for line in params.splitlines():
+        for line in params:
             body.append(f"    {line.strip()}\n")
         body.append(f");\n")
         body.extend(clean_signals)
 
         # Format the macro on a single line with commas between signals
-        macro_line = f"    `define {macro_name} \\\n        " + ", ".join(signal_names) + "\n"
+        # macro_line = f"    `define {macro_name} \\\n        " + ", ".join(signal_names) + "\n"
         body.append(macro_line)
 
         # Provide driver/monitor modports using the macro
@@ -148,7 +103,7 @@ def generate_interfaces_from_top(params,top_content, interfaces_path):
         with open(filename, "w") as f:
             f.writelines(body)
         
-    return has_interfaces
+    return interfaces
 
 ###############################################################################
 # generate_fv_adapter
@@ -159,111 +114,112 @@ def generate_interfaces_from_top(params,top_content, interfaces_path):
 #   - Insert 'assign' lines that connect top-level signals to each interface
 #   - Finally writes out fv_adapter.sv
 ###############################################################################
-def generate_fv_adapter(fv_env_path, interfaces_path, fv_adapter_path):
-    with open(fv_env_path, "r") as f:
-        lines = f.readlines()
+def generate_fv_adapter(parameters, ports, interfaces, fv_env_path, interfaces_path, fv_adapter_path):
+    idented_parameters = ""
+    for line in parameters.splitlines():
+        idented_parameters += (f"  {line}\n")
 
-    param_block = []
-    port_block = []
-    inside_params = False
-    inside_ports = False
+    idented_ports = ""
+    for line in ports.splitlines():
+        idented_ports += (f"  {line}\n")
 
-    # Collect param and port blocks from fv_env.sv
-    for line in lines:
-        if "#(" in line:  # Start of parameter block
-            inside_params = True
-        if inside_params:
-            param_block.append(line)
-            # End param block if we see ")"
-            if ")" in line and not line.strip().endswith(","):
-                inside_params = False
-            continue
+    fv_env_adapter = [
+        "import fv_pkg::*;\n\n",
+        "module fv_env\n",
+        "  #(\n",
+        f"  {idented_parameters}\n" if parameters else "",
+        "  )\n",
+        "  (\n",
+        f"  {idented_ports}\n" if ports else "",
+    ]
 
-        if "(" in line and not port_block:  # Start of port block
-            inside_ports = True
-        if inside_ports:
-            port_block.append(line)
-            if ");" in line:
-                inside_ports = False
-            continue
+    for i, intf in enumerate(interfaces):
+        if i < len(interfaces) - 1:
+            intf_decl = f"  {intf['if_name']}_port_intf.driver {intf['if_name']}_port,\n"
+        else:
+            intf_decl = f"  {intf['if_name']}_port_intf.driver {intf['if_name']}_port\n"
 
-    # We'll parse previously generated interface files to see what signals they contain
-    interface_decls = []
-    assigns = []
+        fv_env_adapter.append(f"  {intf_decl}")
+    fv_env_adapter.append("  );\n\n")
 
-    interface_files = sorted(interfaces_path.glob("*_port_intf.sv"))
-    for file in interface_files:
-        name = file.stem  # e.g. apb_port_intf
-        instance = name.replace("_intf", "")  # e.g. apb_port
-        macro = f"{name}_fields"
+    for intf in interfaces:
+        # We'll add an assign line for each signal in the interface
+        for sig, rng in intf['content']:
+            # Format: assign apb_port.i_paddr = i_paddr;
+            assign_line = f"  assign {intf['if_name']}_port.{sig} = {sig};\n"
+            fv_env_adapter.append(assign_line)
+    
 
-        # Read the macro line from the interface file to get signal names
-        with open(file, "r") as f:
-            content = f.read()
+    fv_env_adapter.append("endmodule\n")
 
-        # Look for something like: `define apb_port_fields \ i_paddr, i_psel ...
-        macro_match = re.search(rf"`define {macro}\s+\\\n\s+(.*?)\n", content, re.DOTALL)
-        if not macro_match:
-            continue
 
-        raw_line = macro_match.group(1)
-        # Remove whitespace and split on comma
-        signal_names = [s.strip() for s in raw_line.split(",") if s.strip()]
-
-        # We'll declare the interface in the port list as:
-        #   apb_port_intf.driver apb_port
-        interface_decls.append(f"    {name}.driver {instance}")
-
-        # For each signal, generate an assign line: assign apb_port.i_paddr = i_paddr;
-        for sig in signal_names:
-            assigns.append(f"  assign {instance}.{sig} = {sig};\n")
-
-    # This step ensures that if the last line before ');' didn't have a comma,
-    # we add one so that we can safely append interface ports
-    if port_block and port_block[-1].strip() == ");":
-        if len(port_block) >= 2:
-            line = port_block[-2].rstrip()
-            if '//' in line:
-                code, comment = line.split('//', 1)
-                code = code.rstrip()
-                if not code.endswith(','):
-                    code += ','
-                port_block[-2] = f"{code} //{comment.strip()}\n"
-            else:
-                if not line.endswith(','):
-                    line += ','
-                port_block[-2] = line + "\n"
-
-        # Remove the closing ');' temporarily
-        port_block = port_block[:-1]
-
-        # Add each interface port with a comma, except the last
-        for i, decl in enumerate(interface_decls):
-            comma = "," if i < len(interface_decls) - 1 else ""
-            port_block.append(f"  {decl}{comma}\n")
-
-        # Apply a small indent
-        port_block = ["  " + line.lstrip() for line in port_block]
-
-        # Re-add the final ');'
-        port_block.append("  );\n")
-
-    # Write out fv_adapter.sv
     with open(fv_adapter_path, "w") as f:
-        f.write("module fv_adapter\n")
-        if param_block:
-            f.writelines(param_block)
-        if port_block:
-            f.writelines(port_block)
-        f.write("\n")
-        # Add the assign lines
-        f.writelines(assigns)
-        f.write("endmodule\n")
+        f.writelines(fv_env_adapter)
 
-def generate_fv_package(fv_pkg_path):
+################################################################################
+def generate_fv_package(parameters, fv_pkg_path):
+    parameters_touple = parse_sv.parse_sv_parameters_info(parameters.splitlines())
+    parameters_line = ""
+    for i, (name, _) in enumerate(parameters_touple):
+        if i < len(parameters_touple) - 1:
+            parameters_line += f".{name}({name}), "
+        else:
+            parameters_line += f".{name}({name})"
+    
+    macro_line = f"    `define param_fields {parameters_line}\n"
+
     with open(fv_pkg_path, "w") as f:
-        f.write("package fv_pkg;\n\nendpackage\n")
+        pkg_content = "package fv_pkg;\n\n"
+        pkg_content += macro_line
+        pkg_content += "endpackage\n"
+        f.write(pkg_content)
 
+################################################################################
+def generate_fv_env_content(parameters, ports, interfaces, main_clk, reset, verif_path):
+    idented_params = ""
+    for line in parameters.splitlines():
+        idented_params += (f"  {line}\n")
+
+    idented_ports = ""
+    for line in ports.splitlines():
+        idented_ports += (f"  {line}\n")
+
+    print(f"Ports:\n{idented_ports}")
+
+    fv_env_content = [
+        "import fv_pkg::*;\n\n",
+        "module fv_env\n",
+        "  #(\n",
+        f"  {idented_params}\n" if parameters else "",
+        "  )\n",
+        "  (\n",
+    ]
+    fv_env_content.extend(idented_ports)
+    fv_env_content.append("  );\n\n")
+    fv_env_content.append(f"  default\n    clocking @(posedge {main_clk});\n  endclocking\n\n")
+    fv_env_content.append(f"  default disable iff ({reset});\n\n")
+
+    parameters_touple = parse_sv.parse_sv_parameters_info(parameters.splitlines())
+    parameters_line = ""
+    for i, (name, _) in enumerate(parameters_touple):
+        if i < len(parameters_touple) - 1:
+            parameters_line += f".{name}({name}), "
+        else:
+            parameters_line += f".{name}({name})"
+
+    # Instantiate each discovered interface
+    for intf in interfaces:
+        fv_env_content.append(f"  {intf['if_name']}_port_intf #(`param_fields) {intf['if_name']}_port();\n")
+
+    # Finally, the adapter instance, if the interfaces are present
+    if bool(interfaces):
+        fv_env_content.append("\n")
+        fv_env_content.append("  fv_adapter fv_adapter(.*);\n")
+    fv_env_content.append("endmodule\n")
+
+    # Write fv_env.sv
+    with open(verif_path / "fv_env.sv", "w") as f:
+        f.writelines(fv_env_content)
 ###############################################################################
 # setup_formal_env
 #
@@ -300,15 +256,15 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
                 continue
             f.write(f"rtl/{rtl_file.name}\n")
 
-    # Simple Makefile to run formal steps
-    makefile_content = """main:
-\tjg ./scripts/fv_run.tcl &
-.PHONY: clean
-clean:
-\trm -rf jgproject
-"""
+    makefile_content = ["main:\n",
+                        "\tjg ./scripts/fv_run.tcl &\n",
+                        ".PHONY: clean\n",
+                        "clean:\n",
+                        "\trm -rf jgproject\n"
+                       ]
+
     with open(prd_path / "Makefile", "w") as f:
-        f.write(makefile_content)
+        f.writelines(makefile_content)
 
     # Create verification directories (verif, checkers, interfaces)
     verif_path = prd_path / "verif"
@@ -331,130 +287,23 @@ clean:
     
     print(f"Found top file: {top_file_path}")
 
-
-
     if top_file_path:
         parameters, ports, content = extract_module_blocks(top_file_path, top_name)
+        print(ports)
         # Generate interface files from top module
-        has_interfaces = generate_interfaces_from_top(parameters, content, interfaces_path)
+        # has_interfaces = generate_interfaces_from_top(parameters, content, interfaces_path)
+        interfaces = generate_interfaces(parameters.splitlines(), ports.splitlines(), interfaces_path)
+        has_interfaces = bool(interfaces)
     else:
         parameters, ports = "", ""
-
-    # print(f"Extracted parameters:\n{parameters}")
-    # print(f"Extracted ports:\n{ports}")
 
     clk_name = clocks[0] if clocks else "clk"
     disable_reset = f"!{reset_name}" if reset_active_low else reset_name
 
     ########################
-    # Convert all top ports to input, preserving comments
+    # Add content to fv_env.sv
     ########################
-    clean_ports = []
-    for line in ports.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # Keep pure comment lines or lines like 'input, //INTERFACE' untouched
-        if line.startswith("//") or re.match(r"^(input|output|inout)\s*,?\s*//", line):
-            clean_ports.append(f"  {line}\n")
-            continue
-
-        # Separate the code from an inline comment
-        code = line.split("//")[0].strip().rstrip(",;")
-        comment = "//" + line.split("//")[1].strip() if "//" in line else ""
-
-        # Force direction to 'input'
-        code = re.sub(r"^(input|output|inout)\s+", "", code)
-        code = f"input {code}".strip()
-
-        # If code becomes empty or comment only, just store it
-        if code.startswith("//") or not code:
-            clean_ports.append(f"  {code} {comment}".rstrip() + "\n")
-        else:
-            # Temporarily add comma at the end to unify our approach
-            clean_ports.append(f"  {code}, {comment}".rstrip() + "\n")
-
-    ########################
-    # Format signal/comment lines properly:
-    #   - No comma on the last signal
-    #   - No comma for comment-only lines
-    #   - 4-space indentation
-    ########################
-    last_signal_idx = None
-    for i in range(len(clean_ports) - 1, -1, -1):
-        line = clean_ports[i].strip()
-        if not line or line.startswith("//") or re.match(r"^\s*input\s*,?\s*//", line):
-            continue
-        last_signal_idx = i
-        break
-
-    for i in range(len(clean_ports)):
-        original = clean_ports[i].strip()
-
-        if not original:
-            clean_ports[i] = "\n"
-            continue
-
-        # Skip pure comment lines
-        if original.startswith("//") or re.match(r"^\s*input\s*,?\s*//", original):
-            clean_ports[i] = f"    {original}\n"
-            continue
-
-        # Split code from inline comment
-        if "//" in original:
-            code, comment = original.split("//", 1)
-            code = code.rstrip().rstrip(",")
-            comment = "//" + comment.strip()
-        else:
-            code = original.rstrip().rstrip(",")
-            comment = ""
-
-        # If this line is not the final signal, add a comma
-        if i != last_signal_idx:
-            code += ","
-
-        # Rebuild line with 4-space indent
-        line = f"    {code}"
-        if comment:
-            line += f" {comment}"
-        clean_ports[i] = line + "\n"
-
-    ########################
-    # Build fv_env.sv
-    ########################
-    idented_params = ""
-    for line in parameters.splitlines():
-        idented_params += (f"  {line}\n")
-
-    fv_env_content = [
-        "import fv_pkg::*;\n\n",
-        "module fv_env\n",
-        "  #(\n",
-        f"  {idented_params}\n" if parameters else "",
-        "  )\n",
-        "  (\n",
-    ]
-    fv_env_content.extend(clean_ports)
-    fv_env_content.append("  );\n\n")
-    fv_env_content.append(f"  default\n    clocking @(posedge {clk_name});\n  endclocking\n\n")
-    fv_env_content.append(f"  default disable iff ({disable_reset});\n\n")
-
-    # Instantiate each discovered interface
-    for file in sorted(interfaces_path.glob("*_port_intf.sv")):
-        intf_type = file.stem
-        inst_name = intf_type.replace("_intf", "")
-        fv_env_content.append(f"  {intf_type} {inst_name}();\n")
-
-    # Finally, the adapter instance, if the interfaces are present
-    if has_interfaces:
-        fv_env_content.append("\n")
-        fv_env_content.append("  fv_adapter fv_adapter(.*);\n")
-    fv_env_content.append("endmodule\n")
-
-    # Write fv_env.sv
-    with open(verif_path / "fv_env.sv", "w") as f:
-        f.writelines(fv_env_content)
+    generate_fv_env_content(parameters, ports, interfaces, clk_name, disable_reset, verif_path)
 
     # Create fv_bind.sv binding fv_env to the top
     with open(verif_path / "fv_bind.sv", "w") as f:
@@ -473,7 +322,6 @@ clean:
     ext = Path(top_file_path).suffix.lower()
 
     language_flag = "-vhdl" if ext == ".vhd" else "-sv09"
-
 
     scripts_path = prd_path / "scripts"
     os.makedirs(scripts_path, exist_ok=True)
@@ -496,12 +344,15 @@ clean:
 
     # Generate fv_adapter after fv_env is finalized
     generate_fv_adapter(
+        parameters,
+        ports,
+        interfaces,
         fv_env_path=verif_path / "fv_env.sv",
         interfaces_path=interfaces_path,
         fv_adapter_path=verif_path / "fv_adapter.sv"
     )
 
-    generate_fv_package(fv_pkg_path=verif_path / "fv_pkg.sv")
+    generate_fv_package(parameters, fv_pkg_path=verif_path / "fv_pkg.sv")
 
     print(f"Formal environment setup completed in: {prd_path}")
 
