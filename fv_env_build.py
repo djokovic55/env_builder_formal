@@ -26,7 +26,7 @@ def extract_module_blocks(top_file_path, top_name):
         content = vhdl_to_sv.generate_sv_module(content, top_name)  # modifies content
         # print(f"VHDL converted into:\n\n{content}")
 
-    print(content)
+    # print(content)
     # Now treat the content as SystemVerilog-style
     param_match = re.search(rf"module\s+{top_name}\s*#\((.*?)\)\s*\(", content, re.DOTALL)
     parameters = param_match.group(1).strip() if param_match else ""
@@ -184,7 +184,7 @@ def generate_fv_env_content(parameters, ports, interfaces, main_clk, reset, veri
     for line in ports.splitlines():
         idented_ports += (f"  {line}\n")
 
-    print(f"Ports:\n{idented_ports}")
+    # print(f"Ports:\n{idented_ports}")
 
     fv_env_content = [
         "import fv_pkg::*;\n\n",
@@ -289,7 +289,7 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
 
     if top_file_path:
         parameters, ports, content = extract_module_blocks(top_file_path, top_name)
-        print(ports)
+        # print(ports)
         # Generate interface files from top module
         # has_interfaces = generate_interfaces_from_top(parameters, content, interfaces_path)
         interfaces = generate_interfaces(parameters.splitlines(), ports.splitlines(), interfaces_path)
@@ -330,7 +330,7 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
     fv_run_content = [
         "clear -all\n",
         "# analyze rtl\n",
-        f"analyze {language_flag} rtl/rtl.f\n",
+        f"analyze {language_flag} -f rtl/rtl.f\n",
         "# analyze verif\n",
         "analyze -sv09 -f verif/verif.f\n\n",
         f"elaborate {language_flag} -top {top_name}\n"
@@ -394,6 +394,7 @@ def revert_formal_env(prd_path):
     # Remove all environment directories and files
     paths_to_remove = [
         rtl_path / "rtl.f",
+        # prd_path / "rtl.f",
         prd_path / "rtl",
         prd_path / "verif",
         prd_path / "scripts",
@@ -419,21 +420,27 @@ if __name__ == "__main__":
     parser.add_argument("--clks", type=str, help="Comma-separated clock names")
     parser.add_argument("--rst", type=str, help="Reset signal name")
     parser.add_argument("--rst_active_low", action="store_true", help="Set if reset is active low")
+    parser.add_argument("--target_dir", default=".", help="Target directory to process (default: current dir)")  # Fixed help text
+
     args = parser.parse_args()
 
-    # Current directory is considered the project root
-    current_dir = Path(__file__).parent.resolve()
+    # Resolve the target directory to absolute path (ensures consistency)
+    target_dir = Path(args.target_dir).resolve()  # Replaces `current_dir`
+    
+    # Validate the target directory exists
+    if not target_dir.is_dir():
+        print(f"Error: Target directory not found: {target_dir}")
+        sys.exit(1)
 
     if args.revert:
-        # Revert environment changes to the initial state
-        revert_formal_env(current_dir)
+        # Revert environment changes in the target directory
+        revert_formal_env(target_dir)
     else:
-        # On normal run, we need top, clks, and rst
+        # Validate required args
         if not args.top or not args.clks or not args.rst:
             print("Error: --top, --clks, and --rst are required unless --revert is used.")
-        else:
-            # Convert comma-separated clocks into a list
-            clocks = [clk.strip() for clk in args.clks.split(",") if clk.strip()]
-
-            # Build the formal environment
-            setup_formal_env(current_dir, args.top, clocks, args.rst, args.rst_active_low)
+            sys.exit(1)
+        
+        # Process clocks and setup formal environment in the target directory
+        clocks = [clk.strip() for clk in args.clks.split(",") if clk.strip()]
+        setup_formal_env(target_dir, args.top, clocks, args.rst, args.rst_active_low)
