@@ -3,6 +3,7 @@
 import argparse
 import subprocess
 import sys
+# import argcomplete
 
 # Define test rules
 RULES = {
@@ -83,6 +84,7 @@ def run_rule(rule_name):
 def main():
     parser = argparse.ArgumentParser(description="Run environment builder tests.")
     parser.add_argument("rule", help=f"Test rule to run. Options: {', '.join(RULES.keys())}")
+    # argcomplete.autocomplete(parser)  # Enable tab completion
     args = parser.parse_args()
 
     run_rule(args.rule)

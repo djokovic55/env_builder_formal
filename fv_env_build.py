@@ -81,7 +81,7 @@ def generate_interfaces(params, ports, interfaces_path):
                 macro_line += f"{sig}\n"
 
 
-        body = [f"interface {intf['if_name']}_port_intf;\n"]
+        body = [f"interface {intf['if_name']}_port_intf\n"]
         body.append(f"#(\n")
         for line in params:
             body.append(f"    {line.strip()}\n")
@@ -119,13 +119,27 @@ def generate_fv_adapter(parameters, ports, interfaces, fv_env_path, interfaces_p
     for line in parameters.splitlines():
         idented_parameters += (f"  {line}\n")
 
+    # FIX - Interface declaration will come ofter the last signal decl in ports -> Adds comma 
+    # strip() removes \n at the end of the last line
+    port_list = ports.strip().splitlines()
+    last_port_line = port_list[-1]
+    # print(f"Last port line BEFORE: {last_port_line}")
+    if "//" in last_port_line:
+        signal, delimiter, comment = last_port_line.partition("//")
+        port_list[-1] = f"    {signal.strip()},     {delimiter} {comment.strip()}"
+    else:
+        port_list[-1] += (",\n")
+    # print(f"Port list last element AFTER: {port_list[-1]}")
+
     idented_ports = ""
-    for line in ports.splitlines():
+    for line in port_list:
         idented_ports += (f"  {line}\n")
+    
+    # print(f"Ports:\n{idented_ports}")
 
     fv_env_adapter = [
         "import fv_pkg::*;\n\n",
-        "module fv_env\n",
+        "module fv_adapter\n",
         "  #(\n",
         f"  {idented_parameters}\n" if parameters else "",
         "  )\n",
@@ -313,15 +327,22 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
     (checkers_path / "checker.sv").touch()
     (interfaces_path / "interface.sv").touch()
 
-    # verif.f includes all .sv in verif/ recursively
     with open(verif_path / "verif.f", "w") as f:
+        # Write *.sv files with 'pkg' first
         for path in sorted(verif_path.rglob("*.sv")):
-            f.write(f"{path.relative_to(prd_path)}\n")
+            if "pkg" in str(path):
+                f.write(f"{path.relative_to(prd_path)}\n")
+        
+        # Write remaining *.sv files
+        for path in sorted(verif_path.rglob("*.sv")):
+            if "pkg" not in str(path):
+                f.write(f"{path.relative_to(prd_path)}\n")
 
     # Build scripts/fv_run.tcl
     ext = Path(top_file_path).suffix.lower()
 
     language_flag = "-vhdl" if ext == ".vhd" else "-sv09"
+    language_flag_elab = "-vhdl" if ext == ".vhd" else ""
 
     scripts_path = prd_path / "scripts"
     os.makedirs(scripts_path, exist_ok=True)
@@ -333,7 +354,7 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
         f"analyze {language_flag} -f rtl/rtl.f\n",
         "# analyze verif\n",
         "analyze -sv09 -f verif/verif.f\n\n",
-        f"elaborate {language_flag} -top {top_name}\n"
+        f"elaborate {language_flag_elab} -top {top_name}\n"
     ]
     for clk in clocks:
         fv_run_content.append(f"clock {clk}\n")
