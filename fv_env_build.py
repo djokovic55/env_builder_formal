@@ -23,54 +23,31 @@ def extract_module_blocks(top_file_path, top_name):
 
     # If VHDL file, convert to SystemVerilog-equivalent content first
     if ext == ".vhd":
-        content = vhdl_to_sv.generate_sv_module(content, top_name)  # modifies content
-        # print(f"VHDL converted into:\n\n{content}")
+        content = vhdl_to_sv.generate_sv_module(content, top_name)  # Converts VHDL to SystemVerilog
 
-    # print(content)
-    # Now treat the content as SystemVerilog-style
+    # Extract parameters block using regex
     param_match = re.search(rf"module\s+{top_name}\s*#\((.*?)\)\s*\(", content, re.DOTALL)
     parameters = param_match.group(1).strip() if param_match else ""
 
+    # Extract ports block using regex
     port_match = re.search(rf"module\s+{top_name}(?:\s*#\(.*?\))?\s*\((.*?)\);", content, re.DOTALL)
-    # ports = port_match.group(1).strip() if port_match else ""
     ports = port_match.group(1) if port_match else ""
-
-
-    # print("PARAMETERS AS A LIST -> \n")
-    # print(parameters.splitlines())
-    # print(type(content))
-    # print(type(parameters))
-    # print(type(ports))
-    # for line in ports.splitlines():
-    #     name, rng = parse_sv.extract_sv_signal_info(line)
-    #     print(f"Signal: {name}, Range: {rng}")
-
-    # print("PORTS AS A LIST -> \n")
-    # print(ports.splitlines())
-
 
     return parameters, ports, content.splitlines()
 
 ###############################################################################
-# generate_interfaces_from_top
+# generate_interfaces
 #
-# Scans the top module file for sections marked by "// XXX INTERFACE" lines.
-# Each section defines signals relevant to an interface (e.g., APB, MEM).
-# Generates a file <interface_name>_port_intf.sv for each interface, with:
-#   - logic declarations
-#   - a macro listing signals
-#   - driver/monitor modports
+# Parses the ports to identify interface blocks and generates interface files.
 ###############################################################################
 def generate_interfaces(params, ports, interfaces_path):
-
     interfaces = parse_sv.parse_sv_interface_info(ports)
 
-    # For each interface block found, create a <name>_port_intf.sv file
+    # For each interface block found, create a corresponding interface file
     for intf in interfaces:
         filename = interfaces_path / f"{intf['if_name']}_port_intf.sv"
 
         clean_signals = []
-        # We'll define a macro like apb_port_intf_fields with each signal name
         macro_name = f"{intf['if_name']}_port_intf_fields"
         macro_line = f"    `define {macro_name} \\\n        "
         for i, (sig, rng) in enumerate(intf['content']):
@@ -80,19 +57,13 @@ def generate_interfaces(params, ports, interfaces_path):
             else:
                 macro_line += f"{sig}\n"
 
-
         body = [f"interface {intf['if_name']}_port_intf\n"]
         body.append(f"#(\n")
         for line in params:
             body.append(f"    {line.strip()}\n")
         body.append(f");\n")
         body.extend(clean_signals)
-
-        # Format the macro on a single line with commas between signals
-        # macro_line = f"    `define {macro_name} \\\n        " + ", ".join(signal_names) + "\n"
         body.append(macro_line)
-
-        # Provide driver/monitor modports using the macro
         body += [
             f"    modport driver  (output `{macro_name});\n",
             f"    modport monitor (input `{macro_name});\n",
@@ -108,35 +79,26 @@ def generate_interfaces(params, ports, interfaces_path):
 ###############################################################################
 # generate_fv_adapter
 #
-# Reads the generated fv_env.sv to:
-#   - Capture any parameters and port block
-#   - Append interface declarations (.driver modports)
-#   - Insert 'assign' lines that connect top-level signals to each interface
-#   - Finally writes out fv_adapter.sv
+# Generates the fv_adapter.sv file to connect top-level signals to interfaces.
 ###############################################################################
 def generate_fv_adapter(parameters, ports, interfaces, fv_env_path, interfaces_path, fv_adapter_path):
     idented_parameters = ""
     for line in parameters.splitlines():
         idented_parameters += (f"  {line}\n")
 
-    # FIX - Interface declaration will come ofter the last signal decl in ports -> Adds comma 
-    # strip() removes \n at the end of the last line
+    # Ensure the last port line ends with a comma
     port_list = ports.strip().splitlines()
     last_port_line = port_list[-1]
-    # print(f"Last port line BEFORE: {last_port_line}")
     if "//" in last_port_line:
         signal, delimiter, comment = last_port_line.partition("//")
         port_list[-1] = f"    {signal.strip()},     {delimiter} {comment.strip()}"
     else:
         port_list[-1] += (",\n")
-    # print(f"Port list last element AFTER: {port_list[-1]}")
 
     idented_ports = ""
     for line in port_list:
         idented_ports += (f"  {line}\n")
     
-    # print(f"Ports:\n{idented_ports}")
-
     fv_env_adapter = [
         "import fv_pkg::*;\n\n",
         "module fv_adapter\n",
@@ -157,20 +119,21 @@ def generate_fv_adapter(parameters, ports, interfaces, fv_env_path, interfaces_p
     fv_env_adapter.append("  );\n\n")
 
     for intf in interfaces:
-        # We'll add an assign line for each signal in the interface
+        # Add assign lines for each signal in the interface
         for sig, rng in intf['content']:
-            # Format: assign apb_port.i_paddr = i_paddr;
             assign_line = f"  assign {intf['if_name']}_port.{sig} = {sig};\n"
             fv_env_adapter.append(assign_line)
     
-
     fv_env_adapter.append("endmodule\n")
-
 
     with open(fv_adapter_path, "w") as f:
         f.writelines(fv_env_adapter)
 
-################################################################################
+###############################################################################
+# generate_fv_package
+#
+# Generates the fv_pkg.sv file containing parameter macros.
+###############################################################################
 def generate_fv_package(parameters, fv_pkg_path):
     parameters_touple = parse_sv.parse_sv_parameters_info(parameters.splitlines())
     parameters_line = ""
@@ -188,7 +151,11 @@ def generate_fv_package(parameters, fv_pkg_path):
         pkg_content += "endpackage\n"
         f.write(pkg_content)
 
-################################################################################
+###############################################################################
+# generate_fv_env_content
+#
+# Generates the fv_env.sv file with the environment setup.
+###############################################################################
 def generate_fv_env_content(parameters, ports, interfaces, main_clk, reset, verif_path):
     idented_params = ""
     for line in parameters.splitlines():
@@ -197,8 +164,6 @@ def generate_fv_env_content(parameters, ports, interfaces, main_clk, reset, veri
     idented_ports = ""
     for line in ports.splitlines():
         idented_ports += (f"  {line}\n")
-
-    # print(f"Ports:\n{idented_ports}")
 
     fv_env_content = [
         "import fv_pkg::*;\n\n",
@@ -234,15 +199,11 @@ def generate_fv_env_content(parameters, ports, interfaces, main_clk, reset, veri
     # Write fv_env.sv
     with open(verif_path / "fv_env.sv", "w") as f:
         f.writelines(fv_env_content)
+
 ###############################################################################
 # setup_formal_env
 #
-# The main entry point for building the environment:
-#   - Creates a snapshot of which RTL files exist
-#   - Moves them into rtl/
-#   - Generates necessary directories (verif, interfaces, scripts...)
-#   - Creates or fills fv_env.sv, fv_adapter.sv, Makefile, etc.
-#   - Fully configures the formal environment based on top_name, clocks, reset
+# Main function to set up the formal verification environment.
 ###############################################################################
 def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
     prd_path = Path(prd_path).resolve()
@@ -303,9 +264,6 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
 
     if top_file_path:
         parameters, ports, content = extract_module_blocks(top_file_path, top_name)
-        # print(ports)
-        # Generate interface files from top module
-        # has_interfaces = generate_interfaces_from_top(parameters, content, interfaces_path)
         interfaces = generate_interfaces(parameters.splitlines(), ports.splitlines(), interfaces_path)
         has_interfaces = bool(interfaces)
     else:
@@ -380,14 +338,12 @@ def setup_formal_env(prd_path, top_name, clocks, reset_name, reset_active_low):
 ###############################################################################
 # revert_formal_env
 #
-# Removes all generated files/folders and moves RTL files back to the root,
-# effectively restoring the initial state (as per .formal_env_snapshot.json).
-# Cross-platform safe: doesn't rely on 'make clean' on Windows.
+# Reverts the formal verification environment to its initial state.
 ###############################################################################
 def revert_formal_env(prd_path):
     prd_path = Path(prd_path).resolve()
 
-    # If a jgproject directory exists, remove it (instead of make clean)
+    # If a jgproject directory exists, remove it
     jgproject_path = prd_path / "jgproject"
     if jgproject_path.exists() and jgproject_path.is_dir():
         shutil.rmtree(jgproject_path, ignore_errors=True)
@@ -415,7 +371,6 @@ def revert_formal_env(prd_path):
     # Remove all environment directories and files
     paths_to_remove = [
         rtl_path / "rtl.f",
-        # prd_path / "rtl.f",
         prd_path / "rtl",
         prd_path / "verif",
         prd_path / "scripts",
@@ -441,27 +396,22 @@ if __name__ == "__main__":
     parser.add_argument("--clks", type=str, help="Comma-separated clock names")
     parser.add_argument("--rst", type=str, help="Reset signal name")
     parser.add_argument("--rst_active_low", action="store_true", help="Set if reset is active low")
-    parser.add_argument("--target_dir", default=".", help="Target directory to process (default: current dir)")  # Fixed help text
+    parser.add_argument("--target_dir", default=".", help="Target directory to process (default: current dir)")
 
     args = parser.parse_args()
 
-    # Resolve the target directory to absolute path (ensures consistency)
-    target_dir = Path(args.target_dir).resolve()  # Replaces `current_dir`
+    target_dir = Path(args.target_dir).resolve()
     
-    # Validate the target directory exists
     if not target_dir.is_dir():
         print(f"Error: Target directory not found: {target_dir}")
         sys.exit(1)
 
     if args.revert:
-        # Revert environment changes in the target directory
         revert_formal_env(target_dir)
     else:
-        # Validate required args
         if not args.top or not args.clks or not args.rst:
             print("Error: --top, --clks, and --rst are required unless --revert is used.")
             sys.exit(1)
         
-        # Process clocks and setup formal environment in the target directory
         clocks = [clk.strip() for clk in args.clks.split(",") if clk.strip()]
         setup_formal_env(target_dir, args.top, clocks, args.rst, args.rst_active_low)

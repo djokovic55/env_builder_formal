@@ -15,13 +15,13 @@ def parse_sv_signal_info(line):
     tokens = line.split()
     tokens = [tok for tok in tokens if tok not in {"input", "logic", "wire", "reg"}]
 
-    # If there's a range in brackets
+    # If there's a range in brackets (e.g., [31:0])
     if tokens and tokens[0].startswith("["):
         range_str = tokens[0]  # Keep brackets included
-        name = tokens[1] if len(tokens) > 1 else None
+        name = tokens[1] if len(tokens) > 1 else None  # Signal name follows the range
     else:
-        range_str = ""
-        name = tokens[0] if tokens else None
+        range_str = ""  # No range specified
+        name = tokens[0] if tokens else None  # Signal name is the first token
 
     return name, range_str
 
@@ -36,9 +36,11 @@ def parse_sv_parameters_info(param_block):
         # Remove trailing commas and comments
         line = line.split('//')[0].strip().rstrip(',')
 
+        # Remove the "parameter" keyword if present
         if line.startswith("parameter"):
             line = line[len("parameter"):].strip()
 
+        # Split the line into name and default value if "=" is present
         if "=" in line:
             name, default = line.split("=", 1)
             param_list.append((name.strip(), default.strip()))
@@ -46,63 +48,57 @@ def parse_sv_parameters_info(param_block):
     return param_list
 
 def parse_sv_interface_info(port_lines):
-    interfaces = []
-    current_if = None
-    inside_interface = False
+    """
+    Parse SystemVerilog interface information from a list of port lines.
+    Extract interface names and their associated signals.
+    """
+    interfaces = []  # List to store parsed interfaces
+    current_if = None  # Current interface being processed
+    inside_interface = False  # Flag to indicate if inside an interface block
 
     for line in port_lines:
         stripped = line.strip()
 
-        # Interface comment line detection
+        # Detect interface comment lines (e.g., "// <name> INTERFACE")
         if stripped.startswith("//") and "INTERFACE" in stripped.upper():
-            # Close previous interface
+            # Close the previous interface if one exists
             if current_if:
                 interfaces.append(current_if)
-            # Start new interface
+            # Start a new interface
             match = re.match(r"//\s*(.*?)\s+INTERFACE", stripped, re.IGNORECASE)
             if match:
-                if_name = match.group(1).strip().lower().replace(" ", "_")
+                if_name = match.group(1).strip().lower().replace(" ", "_")  # Normalize interface name
                 current_if = {
                     "if_name": if_name,
-                    "content": []
+                    "content": []  # List to store signals in the interface
                 }
                 inside_interface = True
             continue
 
-        # End of interface block
+        # End of interface block (detected by empty lines, comments, or closing parenthesis)
         if inside_interface and (stripped.startswith("//") or stripped == "" or stripped == ");"):
             if current_if:
-                interfaces.append(current_if)
-                current_if = None
+                interfaces.append(current_if)  # Add the current interface to the list
+                current_if = None  # Reset current interface
             inside_interface = False
             continue
 
         # If inside an interface block and the line is a signal declaration
-        # if inside_interface and re.match(r"^input\b", stripped):
-        #     # Extract range (e.g., [31:0])
-        #     range_match = re.search(r"\[(.*?)\]", stripped)
-        #     rng = f"[{range_match.group(1)}]" if range_match else ""
-
-        #     # Extract signal name: it's after the last space (after the range)
-        #     # Remove trailing comma or semicolon
-        #     sig_part = stripped.split()[-1].rstrip(",;")
-        #     current_if["content"].append((sig_part, rng))
-
         if inside_interface and stripped.startswith("input"):
-            # Extract range (e.g., [31:0])
+            # Extract signal name and range using the helper function
             sig_name, sig_range = parse_sv_signal_info(line)
 
+            # Add the signal to the current interface's content
             current_if["content"].append((sig_name, sig_range))
 
-    # In case the last interface wasn't closed
+    # In case the last interface wasn't closed, add it to the list
     if current_if:
         interfaces.append(current_if)
 
     return interfaces
 
-
-
 if __name__ == "__main__":
+    # Example port lines to parse
     port_lines = [
         "  input  clk,",
         "  input  reset,",
@@ -136,6 +132,7 @@ if __name__ == "__main__":
         "endmodule"
     ]
 
+    # Parse the interfaces from the port lines
     interfaces = parse_sv_interface_info(port_lines)
     for intf in interfaces:
         print(f"Interface: {intf['if_name']}")
